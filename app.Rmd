@@ -1,0 +1,265 @@
+---
+title: "STAT 486 Stock Screener"
+date: "`r Sys.Date()`"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+    theme: 
+      version: 4
+      bootswatch: lux
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(flexdashboard)
+library(tidyquant)
+library(DT)
+library(shiny)
+library(httr)
+library(jsonlite)
+library(scales)
+library(elmer)
+
+# Load in stock data
+stock_data <- read_csv("portfolio_prices_319.csv") %>% 
+  group_by(Ticker) %>% 
+  mutate(daily_return = (Adjusted / lag(Adjusted)) - 1) %>% na.omit() %>% 
+  mutate(yearly_return = (Adjusted / lag(Adjusted, 252)) - 1)
+
+benchmark_data <- read_csv("VTI.csv") %>% 
+  mutate(benchmark_daily_return = (Adjusted / lag(Adjusted)) - 1) %>% 
+  na.omit()
+
+# Load fundamental data
+fundamental_data <- read_csv("fundamentals_319.csv")
+filter_data <- read_csv("final_data.csv") %>% 
+  mutate(`Standard Deviation` = sqrt(252)*`Standard Deviation`)
+
+# Get most recent risk_free_rate
+risk_free_rate_df <- as.data.frame(getSymbols(Symbols="DTB1YR", src="FRED", auto.assign = FALSE)) %>% 
+  rownames_to_column(var = "date") %>% mutate(date = as.Date(date), # Convert row names into data column
+                                              DTB1YR = DTB1YR / 100)
+risk_free_rate <- slice_tail(risk_free_rate_df)$DTB1YR
+daily_rf_rate <- (1 + slice_tail(risk_free_rate_df)$DTB1YR)^(1/261) - 1
+
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r reactiveDT_backend, include=FALSE}
+filtered_data <- reactive({
+  df <- filter_data
+  
+  # Exchange, Sector, Industry Group, Industry
+  if (input$exchange != "Any") { df <- df %>% filter(Exchange == input$exchange) }
+  if (input$sector != "Any") df <- df %>% filter(`GICS Sector` == input$sector)
+  if (input$industry_group != "Any") df <- df %>% filter(`GICS Industry Group` == input$industry_group)
+  if (input$industry != "Any") df <- df %>% filter(`GICS Industry` == input$industry)
+  
+  # Financial filters (add ranges based on inputs)
+  pe_map <- list("0-10"=c(0,10), "10-20"=c(10,20), "20-30"=c(20,30), "30-40"=c(30,40),
+                 "40-50"=c(40,50), "50+"=c(50, Inf))
+  if (input$pe_ratio != "Any") {
+    rng <- pe_map[[input$pe_ratio]]
+    df <- df %>% filter(`P/E Ratio` >= rng[1], `P/E Ratio` < rng[2])
+  }
+  
+  pb_map <- list("0-10"=c(0,10), "10-20"=c(10,20), "20-30"=c(20,30), "30-40"=c(30,40),
+                 "40-50"=c(40,50), "50+"=c(50, Inf))
+  if (input$pb_ratio != "Any") {
+    rng <- pb_map[[input$pb_ratio]]
+    df <- df %>% filter(`P/B Ratio` >= rng[1], `P/B Ratio` < rng[2])
+  }
+  
+  div_map <- list("0-1%"=c(0,0.01), "1-2%"=c(0.01,0.02), "2-3%"=c(0.02,0.03), "3-4%"=c(0.03,0.04),
+                 "4-5%"=c(0.04,0.05), "5%+"=c(0.05, Inf))
+  if (input$dividend_yield != "Any") {
+    rng <- div_map[[input$dividend_yield]]
+    df <- df %>% filter(`Dividend Yield` >= rng[1], `Dividend Yield` < rng[2])
+  }
+  
+  rev_per_share_map <- list("< 1" = c(-Inf, 1), "1-5" = c(1, 5), "5-10" = c(5, 10),
+                            "10-20" = c(10, 20), "20-50" = c(20, 50), "50-100" = c(50, 100), 
+                            "100+" = c(100, Inf))
+
+  if (input$rev_per_share != "Any") {
+    rng <- rev_per_share_map[[input$rev_per_share]]
+    df <- df %>% filter(`Revenue per Share` >= rng[1], `Revenue per Share` < rng[2])
+  }
+  
+  net_income_per_share_map <- list("< 0" = c(-Inf, 0), "0-1" = c(0, 1), "1-3" = c(1, 3),
+                                   "3-5" = c(3, 5), "5-10" = c(5, 10), "10+" = c(10, Inf))
+  
+  if (input$net_income_per_share != "Any") {
+    rng <- net_income_per_share_map[[input$net_income_per_share]]
+    df <- df %>% filter(`Net Income per Share` >= rng[1], `Net Income per Share` < rng[2])
+  }
+
+  roe_map <- list("< 5%"=c(-Inf, 5), "5-10%"=c(5, 10), "10-15%"=c(10, 15), "15-20%"=c(15, 20),
+                  "20-25%"=c(20, 25), "25%+"=c(25, Inf))
+  if (input$roe != "Any") {
+    rng <- roe_map[[input$roe]]
+    df <- df %>% filter(`ROE` >= rng[1], `ROE` < rng[2])
+  }
+  
+  de_ratio_map <- list("< 0.5"=c(-Inf, 0.5), "0.5-1.0"=c(0.5, 1.0), "1.0-1.5"=c(1.0, 1.5),
+                       "1.5-2.0"=c(1.5, 2.0), "2.0-3.0"=c(2.0, 3.0), "3.0+"=c(3.0, Inf))
+  if (input$de_ratio != "Any") {
+    rng <- de_ratio_map[[input$de_ratio]]
+    df <- df %>% filter(`Debt-to-Equity Ratio` >= rng[1], `Debt-to-Equity Ratio` < rng[2])
+  }
+
+  # Momentum Filters
+  if (input$roc > 0) df <- df %>% filter(ROC >= input$roc)
+  if (input$rsi > 0) df <- df %>% filter(RSI >= input$rsi)
+  if (input$macd_signal != "Any") df <- df %>% filter(`MACD Signal` == input$macd_signal)
+
+  # Risk Metrics
+  df <- df %>%
+    filter(
+      `Standard Deviation` >= input$stdev,
+      Beta >= input$beta,
+      `Max Drawdown (1-Year)` <= input$max_drawdown_1y,
+      `Max Drawdown (5-Year)` <= input$max_drawdown_5y,
+      `VaR Daily` <= input$var_daily,
+      `VaR Annual` <= input$var_annual,
+      `Sharpe Ratio` >= input$sharpe,
+      `Sortino Ratio` >= input$sortino,
+      `Treynor Ratio` >= input$treynor,
+      `Calmar Ratio` >= input$calmar
+    )
+  
+  # Format Results
+  df %>%
+    mutate(
+      `P/E Ratio` = round(`P/E Ratio`, 2),
+      `P/B Ratio` = round(`P/B Ratio`, 2),
+      `Dividend Yield` = label_percent(accuracy=0.01)(`Dividend Yield`),
+      `Revenue per Share` = round(`Revenue per Share`, 2),
+      `Net Income per Share` = round(`Net Income per Share`, 2),
+      `ROE` = label_percent(accuracy=0.01)(`ROE`),
+      `Debt-to-Equity Ratio` = round(`Debt-to-Equity Ratio`, 2),
+      ROC = round(ROC, 2),
+      RSI = round(RSI, 2),
+      `Standard Deviation` = label_percent(accuracy=0.01)(`Standard Deviation`),
+      Beta = round(Beta, 2),
+      `Max Drawdown (1-Year)` = label_percent(accuracy=0.01)(`Max Drawdown (1-Year)`),
+      `Max Drawdown (5-Year)` = label_percent(accuracy=0.01)(`Max Drawdown (5-Year)`),
+      `VaR Daily` = label_percent(accuracy=0.01)(`VaR Daily`),
+      `VaR Annual` = label_percent(accuracy=0.01)(`VaR Annual`),
+      `Sharpe Ratio` = round(`Sharpe Ratio`, 4),
+      `Sortino Ratio` = round(`Sortino Ratio`, 4),
+      `Treynor Ratio` = round(`Treynor Ratio`, 4),
+      `Calmar Ratio` = round(`Calmar Ratio`, 4)
+    )
+})
+```
+
+
+Screener Intro {data-height=150}
+-------------------------------------
+
+### Intro | Created by Benjamin Allen, Eleazar Martin, Connor McGrath, David Lin, and Emma Gruben
+
+This stock screener dashboard allows users to filter and sort a universe of publicly traded companies using a comprehensive set of financial, descriptive, momentum, and risk-based criteria. Users can refine the list of stocks based on exchange, sector, and industry, as well as key financial metrics like P/E ratio, revenue growth, and dividend yield. The screener also incorporates technical indicators such as RSI, MACD signals, and Rate of Change, alongside risk-adjusted performance measures including Sharpe ratio, Sortino ratio, and maximum drawdown. The filtered results are displayed in a sortable data table, with the option to prioritize by any selected metric. This tool is designed to help users efficiently identify stocks that meet specific investment profiles based on a wide array of customizable inputs.
+
+Screener Input {.sidebar data-width=300}
+-------------------------------------
+
+#### Descriptive
+
+```{r}
+inputPanel(
+  selectInput("exchange", "Exchange",
+              choices = c("Any", "NASDAQ", "NYSE"),
+              selected = "Any"),
+  selectInput("sector", "Sector",
+              choices = c("Any", sort(unique(stock_data$`GICS Sector`))),
+              selected = "Any"),
+  selectInput("industry_group", "Industry Group",
+              choices = c("Any", sort(unique(stock_data$`GICS Industry Group`))),
+              selected = "Any"),
+  selectInput("industry", "Industry",
+              choices = c("Any", sort(unique(stock_data$`GICS Industry`))),
+              selected = "Any")
+)
+```
+
+#### Financials
+
+```{r}
+inputPanel(
+  selectInput("pe_ratio", "P/E Ratio",
+              choices = c("Any", "0-10", "10-20", "20-30", "30-40", "40-50", "50+"),
+              selected = "Any"),
+  selectInput("pb_ratio", "P/B Ratio",
+              choices = c("Any", "0-10", "10-20", "20-30", "30-40", "40-50", "50+"),
+              selected = "Any"),
+  selectInput("dividend_yield", "Dividend Yield (%)",
+            choices = c("Any", "0-1%", "1-2%", "2-3%", "3-4%", "4-5%", "5%+"),
+            selected = "Any"),
+  selectInput("rev_per_share", "Revenue per Share (USD)",
+              choices = c("Any", "< 1", "1-5", "5-10", "10-20", "20-50", "50-100", "100+"),
+              selected = "Any"),
+  selectInput("net_income_per_share", "Net Income per Share (USD)",
+              choices = c("Any", "< 0", "0-1", "1-3", "3-5", "5-10", "10+"),
+              selected = "Any"),
+  selectInput("roe", "Return on Equity (ROE) (%)",
+              choices = c("Any", "< 5%", "5-10%", "10-15%", "15-20%", "20-25%", "25%+"),
+              selected = "Any"),
+  selectInput("de_ratio", "Debt-to-Equity Ratio",
+              choices = c("Any", "< 0.5", "0.5-1.0", "1.0-1.5", "1.5-2.0", "2.0-3.0", "3.0+"),
+              selected = "Any")
+)
+```
+
+#### Momentum
+
+```{r}
+inputPanel(
+  sliderInput("roc", "Rate of Change (ROC)",
+              min = 0, max = round(max(filter_data$ROC)), value = 0, step = 1),
+  sliderInput("rsi", "Relative Strength Index (RSI)",
+              min = 0, max = round(max(filter_data$RSI)), value = 0, step = 1),
+  selectInput("macd_signal", "MACD Signal",
+              choices = c("Any", "Buy", "Sell"), selected = "Any")
+)
+```
+
+#### Risk
+
+```{r}
+inputPanel(
+  sliderInput("stdev", "Standard Deviation",
+              min = 0, max = round(max(filter_data$`Standard Deviation`), 2), value = 0, step = 0.05),
+  sliderInput("beta", "Beta",
+              min = round(min(filter_data$Beta)), max = round(max(filter_data$Beta), 2),
+              value = round(min(filter_data$Beta)), step = 0.1),
+  sliderInput("max_drawdown_1y", "Maximum Drawdown (1-Year)",
+              min = -1, max = 0, value = 0, step = 0.05),
+  sliderInput("max_drawdown_5y", "Maximum Drawdown (5-Year)",
+              min = -1, max = 0, value = 0, step = 0.05),
+  sliderInput("var_daily", "Daily Value at Risk (VaR)",
+              min = -0.2, max = 0, value = 0, step = 0.01),
+  sliderInput("var_annual", "Annual Value at Risk (VaR)",
+              min = -1.2, max = 0, value = 0, step = 0.1),
+  sliderInput("sharpe", "Sharpe Ratio",
+              min = -1, max = 1.5, value = -1, step = 0.1),
+  sliderInput("sortino", "Sortino Ratio",
+              min = -1, max = 2.5, value = -1, step = 0.1),
+  sliderInput("treynor", "Treynor Ratio",
+              min = -1, max = 2.5, value = -1, step = 0.1),
+  sliderInput("calmar", "Calmar Ratio",
+              min = -1, max = 5, value = -1, step = 0.2)
+)
+```
+
+Stock List And Chart {data-height=700}
+-------------------------------------
+
+### Stock Table
+
+```{r}
+renderDataTable({ datatable(filtered_data(), options = list(pageLength = 15)) })
+```
